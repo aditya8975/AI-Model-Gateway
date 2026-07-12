@@ -1,0 +1,160 @@
+version: "3.9"
+
+x-app-env: &app-env
+  DATABASE_URL: postgresql+asyncpg://gateway:${POSTGRES_PASSWORD:-gateway}@postgres:5432/gateway
+  REDIS_URL: redis://redis:6379/0
+  ADMIN_MASTER_KEY: ${ADMIN_MASTER_KEY:-change-me-admin-master-key}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  LOG_JSON: "true"
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+  ASR_PROVIDER_API_KEY: ${ASR_PROVIDER_API_KEY:-}
+  TTS_PROVIDER_API_KEY: ${TTS_PROVIDER_API_KEY:-}
+  VISION_PROVIDER_API_KEY: ${VISION_PROVIDER_API_KEY:-}
+
+networks:
+  gateway-net:
+    driver: bridge
+
+volumes:
+  postgres-data:
+  redis-data:
+  grafana-data:
+  prometheus-data:
+
+services:
+  # ------------------------------------------------------------------
+  # Core API service (stateless, horizontally scalable)
+  # ------------------------------------------------------------------
+  gateway:
+    build: .
+    image: ai-model-gateway:latest
+    restart: unless-stopped
+    environment:
+      <<: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - gateway-net
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    deploy:
+      replicas: 1
+
+  # ------------------------------------------------------------------
+  # Async job worker (consumes the Redis Stream request queue)
+  # Scale independently of the API: `docker compose up --scale worker=3`
+  # ------------------------------------------------------------------
+  worker:
+    build: .
+    image: ai-model-gateway:latest
+    restart: unless-stopped
+    command: ["python", "-m", "app.workers.queue_worker"]
+    environment:
+      <<: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - gateway-net
+
+  # ------------------------------------------------------------------
+  # Postgres: API keys, request audit logs
+  # ------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: gateway
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gateway}
+      POSTGRES_DB: gateway
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - gateway-net
+    expose:
+      - "5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gateway -d gateway"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ------------------------------------------------------------------
+  # Redis: rate limiting, request queue (Streams), job status, API-key cache
+  # ------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    networks:
+      - gateway-net
+    expose:
+      - "6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ------------------------------------------------------------------
+  # Nginx: single public entrypoint / reverse proxy / TLS termination point
+  # ------------------------------------------------------------------
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    ports:
+      - "${GATEWAY_PORT:-8080}:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - gateway
+    networks:
+      - gateway-net
+
+  # ------------------------------------------------------------------
+  # Prometheus: scrapes /metrics from the gateway
+  # ------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    restart: unless-stopped
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    networks:
+      - gateway-net
+
+  # ------------------------------------------------------------------
+  # Grafana: dashboards over Prometheus data
+  # ------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:11.4.0
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - gateway-net
