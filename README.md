@@ -13,6 +13,13 @@ mocking). Drop in `OPENAI_API_KEY` (or any OpenAI-compatible provider
 key) via `.env` and the LLM/ASR/TTS/Vision backends transparently
 switch to the real thing — no code changes required.
 
+---
+![Project Home](doc1.png)
+---
+---
+![Project Home](doc2.png)
+---
+
 ## Architecture
 
 ```
